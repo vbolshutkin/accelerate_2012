@@ -1,0 +1,9 @@
+.project
+.cproject
+.settings
+.depend
+obj
+Debug
+Release
+run
+test_input_1
