@@ -11,14 +11,14 @@
 #include <sys/time.h>
 #include <limits.h>
 
+#include <stdint.h>
+
+#include <smmintrin.h> // SSE 4.2
+
+#include "common.h"
 #include "bm.h"
 #include "kmp.h"
-
-#define MALLOC_IT(ptr, sz) (ptr) = malloc((sz) * sizeof(*(ptr)))
-#define REALLOC_IT(ptr, sz) (ptr) = realloc(ptr, (sz) * sizeof(*(ptr)))
-
-#define FALSE 0
-#define TRUE 1
+#include "karkkainen.h"
 
 #define DECLARE_TIME_MEASUREMENT struct timeval start, finish
 #define START_TIME_MEASURE gettimeofday(&start, 0)
@@ -42,7 +42,10 @@ typedef struct {
 uint minMatchLength;
 uint m;
 
+uint n_threads;
+
 seq refseq;
+int *ref_suffix_array;
 
 uint n_otherseqs = 0;
 seq* otherseqs = NULL;
@@ -73,6 +76,7 @@ char decode_char(char c) {
 	case 3:
 		return 'C';
 	default:
+		printf(" wrong symbol!");
 		exit(-1);
 	}
 }
@@ -82,9 +86,9 @@ void print_seq(seq* s) {
 	int i;
 	for (i = 0; i < s->len; ++i) {
 
-		char c = s->ptr[i] % 4;
+		unsigned char c = s->ptr[i];
 
-		c = decode_char(c);
+		c = decode_char(c % 4);
 
 		printf("%c", c);
 	}
@@ -95,7 +99,7 @@ void put_char(char c, unsigned char* ptr, uint index) {
 
     c = encode_char(c);
 
-	uint step = minMatchLength / 4;
+	uint step = m;
 
 	char ix;
 	for (ix = 1; (ix < 4) && (index >= step * ix); ++ix) {
@@ -130,6 +134,9 @@ void read_ref_file(char* fname) {
 		short i;
 		for (i = 0; i < read; ++i) {
 			char c = buffer[i];
+			if (c == '>') {
+				goto out;
+			}
 			if (c == 'G' || c == 'T' || c == 'A' || c == 'C') {
 				put_char(c, refseq.ptr, seqlen);
 				++seqlen;
@@ -137,6 +144,7 @@ void read_ref_file(char* fname) {
 		}
 
 	}
+out:
 
 	refseq.ptr[seqlen] = 0;
 	refseq.len = seqlen;
@@ -231,44 +239,188 @@ void read_input_file(char* fname) {
 
 }
 
-// sa - needle
-// sb - haystack
-char find_lcs(seq *sa, seq *sb, uint aoffset, uint alimit, uint boffset, uint blimit, ans *out) {
-	unsigned char *needle = &sa->ptr[aoffset];
-	unsigned char *haystack = &sb->ptr[boffset];
 
-	const unsigned char *bmres = substring_kmp(haystack, blimit - boffset, needle, m);
-	if (NULL != bmres) {
-		uint hs_offset = bmres - haystack;
 
-//		printf("bmres pos: %d\n", hs_offset);
-		uint commonlen = m * 4;
 
-		uint i;
-		for (i = m; i < blimit - hs_offset; ++i) {
-			if (haystack[hs_offset + i] != needle[i]) {
-				break;
+
+typedef enum { ANY, LEFT, RIGHT } Direction;
+
+int dihotomy(int* suffix_array,
+		 int n_offset,
+		 int lo, int hi,
+		 const unsigned char* haystack,
+	     const unsigned char* needle, Direction dir) {
+
+	unsigned char nc = needle[n_offset];
+
+	while (hi >= lo) {
+
+		// check hi and lo
+		if (dir == LEFT || dir == ANY) {
+			if (haystack[suffix_array[lo] + n_offset] == nc) {
+				return lo;
 			}
-			++commonlen;
+		}
+		if (dir == RIGHT || dir == ANY) {
+			if (haystack[suffix_array[hi] + n_offset] == nc) {
+				return hi;
+			}
+		}
+		if (dir == LEFT) {
+			if (haystack[suffix_array[hi-1] + n_offset] != nc) {
+				return hi;
+			}
+		}
+		if (dir == RIGHT) {
+			if (haystack[suffix_array[lo+1] + n_offset] != nc) {
+				return lo;
+			}
 		}
 
-		out->refoffset = aoffset + 1;
-		out->reflimit = out->refoffset + commonlen - 1;
-		out->othoffset = boffset + hs_offset + 1;
-		out->othlimit = out->othoffset + commonlen - 1;
+		int mid = (hi + lo) / 2;
+		int h_index = suffix_array[mid];
+		unsigned char hc = haystack[h_index + n_offset];
+		if (hc > nc) {
+			if (dir != ANY) {
+				if (hi == mid) {
+					return mid;
+				}
+				hi = mid;
+			} else {
+//				if (hi == mid + 1) {
+//					break;
+//				}
+				hi = mid - 1;
+			}
+		} else if (hc < nc) {
+			if (dir != ANY) {
+				if (lo == mid) {
+					return mid;
+				}
+				lo = mid;
+			} else {
+//				if (lo == mid - 1) {
+//					break;
+//				}
+				lo = mid + 1;
+			}
+		} else {
+			if (dir == LEFT) {
+				if (haystack[suffix_array[mid-1] + n_offset] != nc) {
+					return mid;
+				}
+				hi = mid;
+			} else if (dir == RIGHT) {
+				if (haystack[suffix_array[mid+1] + n_offset] != nc) {
+					return mid;
+				}
+				lo = mid;
+			} else { // dir == ANY
+				return mid;
+			}
 
-//		printf("commonlen: %d\n", commonlen);
-//
-//		seq s;
-//		s.len = commonlen;
-//		s.ptr = haystack + hs_offset;
-//		s.name = "substring";
-//		print_seq(&s);
-
-		return TRUE;
+		}
 	}
-	return FALSE;
+    return -1;
 }
+
+void substring_found(const unsigned char* substr, const unsigned char* haystack, uint hlimit,
+	     const unsigned char* needle, uint noffset) {
+	uint hs_offset = substr - haystack;
+
+	if (hs_offset > 0 && noffset > 0) {
+		if (haystack[hs_offset-1] == needle[-1]) {
+			return;
+		}
+	}
+
+	uint commonlen = m * 4;
+
+	uint i;
+	for (i = m; i < hlimit - hs_offset - m * 3; ++i) {
+		if (haystack[hs_offset + i] != needle[i]) {
+			break;
+		}
+		++commonlen;
+	}
+
+	if (commonlen < minMatchLength) {
+		return;
+	}
+
+	ans a;
+	ans *out = &a;
+
+	out->othoffset = noffset + 1;
+	out->othlimit = out->othoffset + commonlen - 1;
+	out->refoffset = hs_offset + 1;
+	out->reflimit = out->refoffset + commonlen - 1;
+
+	// debug output
+	printf("%d %d %d %d\n", a.refoffset, a.reflimit, a.othoffset, a.othlimit);
+
+//	seq dbgref;
+//	dbgref.ptr = refseq.ptr + a.refoffset - 1;
+//	dbgref.name = "dbgref";
+//	dbgref.len = a.reflimit - a.refoffset + 1;
+//	print_seq(&dbgref);
+//
+//	seq dbgoth;
+//	dbgoth.ptr = otherseqs[0].ptr + a.othoffset - 1;
+//	dbgoth.name = "dbgoth";
+//	dbgoth.len = a.othlimit - a.othoffset + 1;
+//	print_seq(&dbgoth);
+
+
+}
+
+void substring_suffix_array(int* suffix_array,
+		 const unsigned char* haystack, size_t hlen,
+	     const unsigned char* needle,   size_t nlen,
+	     uint noffset) {
+
+	int lo = 0, hi = hlen - 1;
+
+	int n_offset = 0;
+
+	int lb = lo, rb = hi;
+
+	while (n_offset < nlen) {
+		// we should return lo and hi out of here to save some time
+		int d = dihotomy(suffix_array, n_offset, lo, hi, haystack, needle, ANY);
+		if (d == -1) {
+			return;
+		}
+		lb = dihotomy(suffix_array, n_offset, lo, d, haystack, needle, LEFT);
+		rb = dihotomy(suffix_array, n_offset, d, hi, haystack, needle, RIGHT);
+		if (lb == rb && lb != -1) {
+			char eq = suffix_array[lb] >= hlen - nlen ||
+					memcmp(haystack + suffix_array[lb] + n_offset, needle + n_offset, nlen - n_offset);
+
+			if (eq == 0) {
+				break;
+			}
+		}
+
+		lo = lb;
+		hi = rb;
+		++n_offset;
+	}
+
+	// here are a lot of correct answers?
+	int i;
+	for (i = lb; i <= rb; ++i) {
+		substring_found(haystack + suffix_array[i], haystack, hlen, needle, noffset);
+	}
+}
+
+
+
+
+
+
+
+
 
 
 int main(int argc, char* argv[]) {
@@ -276,42 +428,53 @@ int main(int argc, char* argv[]) {
 	DECLARE_TIME_MEASUREMENT;
 	START_TIME_MEASURE;
 
-
-
-//	// first command line argument : number of worker threads to use
-//	// not used in this program at this time
-//
-//	// first command line argument : window size
+	n_threads = atol(argv[1]);
 	minMatchLength = atol(argv[2]);
 	m = minMatchLength / 4;
 
 	read_ref_file(argv[3]);
-//	print_seq(&refseq);
-
 	read_input_file(argv[4]);
-//	int i;
-//	for (i = 0; i < n_otherseqs; ++i) {
-//		print_seq(&otherseqs[i]);
-//	}
 
-	uint ref_iter;
-	for (ref_iter = 0; ref_iter < refseq.len - minMatchLength; ++ref_iter) {
-		//printf("ref_iter: %d\n", ref_iter);
-		ans a;
-		char f;
-		uint other_shift = 0;
-		do {
-			f = find_lcs(&refseq, &otherseqs[0], ref_iter, refseq.len, other_shift, otherseqs[0].len, &a);
-			if (f) {
-				other_shift = a.othlimit;
-				printf("%d %d %d %d\n", a.refoffset, a.reflimit, a.othoffset, a.othlimit);
-			}
-		} while(f);
+	FINISH_TIME_MEASURE;
+	printf("reading took %ld ms\n", TIME_ELAPSED);
+	START_TIME_MEASURE;
+
+
+	MALLOC_IT(ref_suffix_array, refseq.len);
+	suffixArray(refseq.ptr, ref_suffix_array, refseq.len, 256);
+
+
+//	const unsigned char * ptr = substring_suffix_array(ref_suffix_array, refseq.ptr, refseq.len, otherseqs[0].ptr, 4);
+//    if (ptr != NULL) {
+//		seq print;
+//		print.ptr = ptr;
+//		print.len = 20;
+//		print.name = "print";
+//		print_seq(&print);
+//    } else {
+//    	printf("test substring not found!\n");
+//    }
+//
+//
+//
+//	exit(0);
+
+	FINISH_TIME_MEASURE;
+	printf("suffix array generation took %ld ms\n", TIME_ELAPSED);
+	START_TIME_MEASURE;
+
+	seq oth = otherseqs[0];
+	uint oth_iter;
+	for (oth_iter = 0; oth_iter < oth.len - minMatchLength; ++oth_iter) {
+		substring_suffix_array(ref_suffix_array,
+				refseq.ptr, refseq.len,
+				oth.ptr + oth_iter, m, oth_iter);
 	}
 
 	FINISH_TIME_MEASURE;
 	printf("OK, took %ld ms\n", TIME_ELAPSED);
 
+	free(ref_suffix_array);
 
 	return 0;
 }
