@@ -8,10 +8,13 @@
 #include <string.h>
 #include <math.h>
 
-#include <sys/time.h>
 #include <limits.h>
 
 #include <stdint.h>
+
+#include <pthread.h>
+#include <omp.h>
+
 
 #include <smmintrin.h> // SSE 4.2
 
@@ -20,10 +23,6 @@
 #include "kmp.h"
 #include "karkkainen.h"
 
-#define DECLARE_TIME_MEASUREMENT struct timeval start, finish
-#define START_TIME_MEASURE gettimeofday(&start, 0)
-#define FINISH_TIME_MEASURE gettimeofday(&finish, 0)
-#define TIME_ELAPSED ((finish.tv_sec-start.tv_sec)*1000 + (finish.tv_usec-start.tv_usec)/1000)
 
 
 typedef struct {
@@ -38,6 +37,14 @@ typedef struct {
 	uint othoffset;
 	uint othlimit;
 } ans;
+
+typedef struct {
+	seq * ref;
+	uint n_otherseqs;
+	seq * otherseqs;
+
+	uint ref_offset;
+} task_t;
 
 uint minMatchLength;
 uint m;
@@ -245,6 +252,19 @@ void read_input_file(char* fname) {
 
 typedef enum { ANY, LEFT, RIGHT } Direction;
 
+void check_sa(int * ref_suffix_array, uint len, uint ref_offset) {
+	int i; long s1 = 0, s2 = 0;
+	for (i= 0; i < len; ++i) {
+		s1 += ref_suffix_array[i];
+		s2 += i;
+	}
+	if (s1 == s2 ) {
+		printf("sa %ld of length %d is ok\n", ref_suffix_array, len);
+	} else {
+		printf("WTF? %ld %ld\n", s1, s2);
+	}
+}
+
 int dihotomy(int* suffix_array,
 		 int n_offset,
 		 int lo, int hi,
@@ -277,34 +297,34 @@ int dihotomy(int* suffix_array,
 			}
 		}
 
-		int mid = (hi + lo) / 2;
-		int h_index = suffix_array[mid];
+
+		//printf("hi lo %d %d\n", hi, lo);
+		uint mid = (hi + lo) / 2;
+		uint h_index = suffix_array[mid];
 		unsigned char hc = haystack[h_index + n_offset];
+
+		//printf("middle\n");
+
 		if (hc > nc) {
 			if (dir != ANY) {
 				if (hi == mid) {
-					return mid;
+					return mid; // FIXME why not break?
 				}
 				hi = mid;
 			} else {
-//				if (hi == mid + 1) {
-//					break;
-//				}
 				hi = mid - 1;
 			}
 		} else if (hc < nc) {
 			if (dir != ANY) {
 				if (lo == mid) {
-					return mid;
+					return mid; // FIXME why not break?
 				}
 				lo = mid;
 			} else {
-//				if (lo == mid - 1) {
-//					break;
-//				}
 				lo = mid + 1;
 			}
 		} else {
+			//printf("eq before\n");
 			if (dir == LEFT) {
 				if (haystack[suffix_array[mid-1] + n_offset] != nc) {
 					return mid;
@@ -325,11 +345,11 @@ int dihotomy(int* suffix_array,
 }
 
 void substring_found(const unsigned char* substr, const unsigned char* haystack, uint hlimit,
-	     const unsigned char* needle, uint noffset) {
+	     const unsigned char* needle, uint noffset, uint subtask_ref_offset) {
 	uint hs_offset = substr - haystack;
 
-	if (hs_offset > 0 && noffset > 0) {
-		if (haystack[hs_offset-1] == needle[-1]) {
+	if (subtask_ref_offset + hs_offset > 0 && noffset > 0) {
+		if (substr[-1] == needle[-1]) {
 			return;
 		}
 	}
@@ -353,31 +373,17 @@ void substring_found(const unsigned char* substr, const unsigned char* haystack,
 
 	out->othoffset = noffset + 1;
 	out->othlimit = out->othoffset + commonlen - 1;
-	out->refoffset = hs_offset + 1;
+	out->refoffset = subtask_ref_offset + hs_offset + 1;
 	out->reflimit = out->refoffset + commonlen - 1;
 
 	// debug output
 	printf("%d %d %d %d\n", a.refoffset, a.reflimit, a.othoffset, a.othlimit);
-
-//	seq dbgref;
-//	dbgref.ptr = refseq.ptr + a.refoffset - 1;
-//	dbgref.name = "dbgref";
-//	dbgref.len = a.reflimit - a.refoffset + 1;
-//	print_seq(&dbgref);
-//
-//	seq dbgoth;
-//	dbgoth.ptr = otherseqs[0].ptr + a.othoffset - 1;
-//	dbgoth.name = "dbgoth";
-//	dbgoth.len = a.othlimit - a.othoffset + 1;
-//	print_seq(&dbgoth);
-
-
 }
 
 void substring_suffix_array(int* suffix_array,
 		 const unsigned char* haystack, size_t hlen,
 	     const unsigned char* needle,   size_t nlen,
-	     uint noffset) {
+	     uint noffset, uint subtask_ref_offset) {
 
 	int lo = 0, hi = hlen - 1;
 
@@ -386,7 +392,6 @@ void substring_suffix_array(int* suffix_array,
 	int lb = lo, rb = hi;
 
 	while (n_offset < nlen) {
-		// we should return lo and hi out of here to save some time
 		int d = dihotomy(suffix_array, n_offset, lo, hi, haystack, needle, ANY);
 		if (d == -1) {
 			return;
@@ -407,21 +412,61 @@ void substring_suffix_array(int* suffix_array,
 		++n_offset;
 	}
 
-	// here are a lot of correct answers?
+	// here can be a lot of matches
 	int i;
 	for (i = lb; i <= rb; ++i) {
-		substring_found(haystack + suffix_array[i], haystack, hlen, needle, noffset);
+		substring_found(haystack + suffix_array[i], haystack, hlen, needle, noffset, subtask_ref_offset);
 	}
 }
 
+void solve_task(task_t * st) {
 
+	int * MALLOC_IT(ref_suffix_array, st->ref->len);
+	suffixArray(st->ref->ptr, ref_suffix_array, st->ref->len, 256);
 
+	int i;
+	for (i = 0; i < st->n_otherseqs; ++i) {
+		seq oth = st->otherseqs[i];
+		uint oth_iter;
+		for (oth_iter = 0; oth_iter < oth.len - minMatchLength;
+				++oth_iter) {
 
+			substring_suffix_array(ref_suffix_array, st->ref->ptr,
+					st->ref->len, oth.ptr + oth_iter, m,
+					oth_iter, st->ref_offset);
+		}
+	}
 
+	free(ref_suffix_array);
+}
 
+void decompose_task(task_t * parent, char parts, task_t * out) {
 
+	int plen = parent->ref->len;
 
+	int i;
+	for (i = 0; i < parts; ++i) {
+		int offset = i * plen / parts;
+		int len = plen / parts + m / 4;
+		if (len >= plen - offset) {
+			len = plen - offset;
+		}
+		seq * MALLOC_IT(tmprefp, 1);
+		seq tmpref = {"", len, parent->ref->ptr + offset};
+		*tmprefp = tmpref;
 
+		task_t tmp = {tmprefp, parent->n_otherseqs, parent->otherseqs, offset};
+		out[i] = tmp;
+	}
+
+}
+
+void *thread_func_solve(void *vptr_args)
+{
+	task_t *task = (task_t*)vptr_args;
+	solve_task(task);
+    return NULL;
+}
 
 int main(int argc, char* argv[]) {
 
@@ -429,6 +474,10 @@ int main(int argc, char* argv[]) {
 	START_TIME_MEASURE;
 
 	n_threads = atol(argv[1]);
+	omp_set_dynamic(0);      // запретить библиотеке openmp менять число потоков во время исполнения
+	omp_set_num_threads(n_threads); // установить число потоков в 10
+
+
 	minMatchLength = atol(argv[2]);
 	m = minMatchLength / 4;
 
@@ -439,142 +488,25 @@ int main(int argc, char* argv[]) {
 	printf("reading took %ld ms\n", TIME_ELAPSED);
 	START_TIME_MEASURE;
 
+    task_t task = {&refseq, n_otherseqs, otherseqs, 0};
 
-	MALLOC_IT(ref_suffix_array, refseq.len);
-	suffixArray(refseq.ptr, ref_suffix_array, refseq.len, 256);
+    char parts = n_threads;
 
 
-//	const unsigned char * ptr = substring_suffix_array(ref_suffix_array, refseq.ptr, refseq.len, otherseqs[0].ptr, 4);
-//    if (ptr != NULL) {
-//		seq print;
-//		print.ptr = ptr;
-//		print.len = 20;
-//		print.name = "print";
-//		print_seq(&print);
-//    } else {
-//    	printf("test substring not found!\n");
-//    }
-//
-//
-//
-//	exit(0);
+    task_t * MALLOC_IT(subtasks, parts);
+    decompose_task(&task, parts, subtasks);
+    int i;
 
-	FINISH_TIME_MEASURE;
-	printf("suffix array generation took %ld ms\n", TIME_ELAPSED);
-	START_TIME_MEASURE;
-
-	seq oth = otherseqs[0];
-	uint oth_iter;
-	for (oth_iter = 0; oth_iter < oth.len - minMatchLength; ++oth_iter) {
-		substring_suffix_array(ref_suffix_array,
-				refseq.ptr, refseq.len,
-				oth.ptr + oth_iter, m, oth_iter);
+	#pragma omp parallel for private(i)
+	for (i = 0; i < parts; ++i) {
+		solve_task(&subtasks[i]);
 	}
+
+    free(subtasks);
+
 
 	FINISH_TIME_MEASURE;
 	printf("OK, took %ld ms\n", TIME_ELAPSED);
 
-	free(ref_suffix_array);
-
 	return 0;
 }
-
-//pair<string,char*> getSequence(ifstream& s){
-//	string sequence;
-//	string name;
-//
-//	if(s.get()=='>')
-//		getline(s,name);
-//
-//	while (!s.eof()){
-//		int c = s.get(); //get char from reference Sequence file
-//		if(c == '>'){
-//			s.unget();
-//			break;
-//		}
-//		else if (c == 'G' || c=='T' || c=='A' || c=='C'){
-//			sequence.push_back(c);
-//		}
-//		// ignore every other chars (newline, etc)
-//	}
-//
-//	return make_pair(name,sequence.c_str());
-//}
-
-//	// second command line argument : reference sequence file
-//	ifstream refSeqFile(argv[3],ios::in);
-//	pair<string,char*> ref = getSequence(refSeqFile);
-//	string refSeqName = ref.first;
-//	char* refSeq = ref.second;
-//
-//	// following command line arguments : other files containing sequences
-//	// result is stored in an associative array ordered by title
-//	map<string,string> otherSequences;
-//	for(int i=4; i<argc; i++){ // iterate over command arguments
-//		ifstream seqFile(argv[i],ios::in);
-//		while(!seqFile.eof()){
-//			pair<string,string> other = getSequence(seqFile);
-//			otherSequences[other.first] = other.second;
-//		}
-//	}
-//
-//	// compare other sequences to reference sequence
-//	// iterate over other sequences
-//	for(map<string,string>::iterator sequencesIter = otherSequences.begin(); sequencesIter!=otherSequences.end(); sequencesIter++){
-//		// output sequence name
-//		cout << sequencesIter->first << "\n";
-//		string otherSeq = sequencesIter->second;
-//
-//		// L[i][j] will contain length of the longest substring
-//		// ending by positions i in refSeq and j in otherSeq
-//		size_t **L = new size_t*[refSeq.length()];
-//		for(size_t i=0; i<refSeq.length();++i)
-//			L[i] = new size_t[otherSeq.length()];
-//
-//		// iteration over the characters of the reference sequence
-//		for(size_t i=0; i<refSeq.length();i++){
-//			// iteration over the characters of the sequence to compare
-//			for(size_t j=0; j<otherSeq.length();j++){
-//				// if the characters are the same,
-//				// increase the consecutive matching score from the previous cell
-//				if(refSeq[i]==otherSeq[j]){
-//					if(i==0 || j==0)
-//						L[i][j]=1;
-//					else
-//						L[i][j] = L[i-1][j-1] + 1;
-//				}
-//				// or reset the matching score to 0
-//				else
-//					L[i][j]=0;
-//			}
-//		}
-//
-//		// output the matches for this sequence
-//		// length must be at least minMatchLength
-//		// and the longest possible.
-//		for(size_t i=0; i<refSeq.length();i++){
-//			for(size_t j=0; j<otherSeq.length();j++){
-//
-//				if(L[i][j]>=minMatchLength) {
-//					//this match can be shifted on i and j
-//					if(i+1<refSeq.length() && j+1<otherSeq.length() && L[i][j]<=L[i+1][j+1])
-//						continue;
-//					//this match can be shifted on j
-//					if(i<refSeq.length() && j+1<otherSeq.length() && L[i][j]<=L[i][j+1])
-//						continue;
-//					//this match can be shifted on i
-//					if(i+1<refSeq.length() && j<otherSeq.length() && L[i][j]<=L[i+1][j])
-//						continue;
-//					cout << i-L[i][j]+2 << " " << i+1 << " " << j-L[i][j]+2 << " " << j+1 << "\n";
-//
-//					// output the matching sequences for debugging :
-//					//cout << refSeq.substr(i-L[i][j]+1,L[i][j]) << "\n";
-//					//cout << otherSeq.substr(j-L[i][j]+1,L[i][j]) << "\n";
-//				}
-//			}
-//		}
-//
-//		for(size_t i=0; i<refSeq.length();++i)
-//			delete[] L[i];
-//		delete[] L;
-//	}
